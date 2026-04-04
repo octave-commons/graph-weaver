@@ -6,6 +6,14 @@ A small dev service that:
 2. shows it in a WebGL graph view
 3. passively grows a web graph from discovered external links using an ACO-ish crawler
 
+## Reading order
+
+1. `docs/INDEX.md`
+2. `docs/FORK_TALES_SOURCE_MAP.md`
+3. `specs/service-surface.md`
+4. `specs/graph-layers-and-storage.md`
+5. `specs/query-preview-and-mutation.md`
+
 ## Run (docker)
 
 ```bash
@@ -35,3 +43,8 @@ Optional:
 
 - `GRAPH_WEAVER_ADMIN_TOKEN` — if set, GraphQL mutations require `Authorization: Bearer <token>`
 - `STATE_DIR` (default: `.opencode/runtime`) — where config + user-layer graph snapshots are stored
+
+## Adjacent repos
+
+- `octave-commons/graph-weaver-aco` — ACO traversal kernel
+- `octave-commons/myrmex` — richer extraction/integration orchestrator
