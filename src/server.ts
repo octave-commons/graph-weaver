@@ -174,6 +174,7 @@ async function main(): Promise<void> {
   const host = process.env.HOST || "0.0.0.0";
   const port = Number(process.env.PORT || "8796");
   const repoRoot = process.env.REPO_ROOT || (await repoRootFromGit(process.cwd())) || process.cwd();
+  const webCrawlEnabled = !/^(0|false|no)$/i.test(String(process.env.GRAPH_WEAVER_WEB_CRAWL_ENABLED || "true"));
 
   const vendorWebglDist =
     process.env.WEBGL_GRAPH_VIEW_DIST || path.join(repoRoot, "packages/webgl-graph-view/dist");
@@ -371,6 +372,13 @@ async function main(): Promise<void> {
     });
 
   const startWeaver = () => {
+    if (!webCrawlEnabled) {
+      if (weaver) {
+        weaver.stop();
+        weaver = null;
+      }
+      return;
+    }
     if (weaver) {
       weaver.stop();
       weaver = null;
@@ -394,7 +402,9 @@ async function main(): Promise<void> {
     rescanTimer = setInterval(() => {
       void (async () => {
         await rebuildLocal();
-        weaver?.seed(lastSeeds);
+        if (webCrawlEnabled) {
+          weaver?.seed(lastSeeds);
+        }
         markDirty();
       })();
     }, config.scan.rescanIntervalMs);
@@ -454,6 +464,7 @@ async function main(): Promise<void> {
       edges,
       seeds: lastSeeds.length,
       weaver: weaver?.stats() ?? { frontier: 0, inFlight: 0 },
+      webCrawlEnabled,
       render: config.render,
       scan: config.scan,
     };
@@ -883,6 +894,8 @@ async function main(): Promise<void> {
     console.log(`[devel-graph-weaver] stateDir ${stateDir}`);
     // eslint-disable-next-line no-console
     console.log(`[devel-graph-weaver] mongo ${String(process.env.MONGODB_URI || "mongodb://mongodb:27017").trim()} db=${String(process.env.MONGODB_DB || "devel_graph_weaver").trim()}`);
+    // eslint-disable-next-line no-console
+    console.log(`[devel-graph-weaver] web crawl ${webCrawlEnabled ? "enabled" : "disabled"}`);
   });
 }
 

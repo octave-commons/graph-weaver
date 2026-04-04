@@ -43,6 +43,7 @@ Optional:
 
 - `GRAPH_WEAVER_ADMIN_TOKEN` — if set, GraphQL mutations require `Authorization: Bearer <token>`
 - `STATE_DIR` (default: `.opencode/runtime`) — where config + user-layer graph snapshots are stored
+- `GRAPH_WEAVER_WEB_CRAWL_ENABLED` (default: `true`) — set to `false` when Myrmex owns web crawling and this service should remain a local/UI graph workbench
 
 ## Adjacent repos
 
