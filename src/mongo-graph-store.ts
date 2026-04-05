@@ -166,6 +166,19 @@ export class MongoGraphStore {
     ]);
   }
 
+  async bulkRemoveNodes(store: string, ids: string[]): Promise<void> {
+    const uniqueIds = [...new Set(ids.map((id) => String(id || "").trim()).filter(Boolean))];
+    if (uniqueIds.length === 0) return;
+
+    await Promise.all([
+      this.getNodes().deleteMany({ store, id: { $in: uniqueIds } }),
+      this.getEdges().deleteMany({
+        store,
+        $or: [{ source: { $in: uniqueIds } }, { target: { $in: uniqueIds } }],
+      }),
+    ]);
+  }
+
   async removeEdge(store: string, id: string): Promise<void> {
     await this.getEdges().deleteOne({ store, id });
   }

@@ -4,10 +4,20 @@ function normalizeRepoPath(filePath: string): string {
   return filePath.replace(/\\/g, "/");
 }
 
+const ignoredRepoDirs = new Set([
+  ".pnpm-store",
+  ".clj-kondo",
+  ".cpcache",
+  ".shadow-cljs",
+  "node_modules",
+  "dist",
+  "target",
+]);
+
 function isIgnoredRepoPath(filePath: string): boolean {
   const normalized = normalizeRepoPath(filePath);
   const parts = normalized.split("/");
-  return parts.includes(".pnpm-store");
+  return parts.some((part) => ignoredRepoDirs.has(part));
 }
 
 function runGitZ(args: string[], cwd: string): Promise<string[]> {

@@ -13,7 +13,9 @@ import { applyConfigPatch, defaultConfigFromEnv, type ConfigPatch, type RuntimeC
 import { createGraphQLHandler } from "./graphql.js";
 import { repoRootFromGit } from "./git.js";
 import { layoutGraph } from "./layout.js";
+import { rebuildLakeGraph } from "./lakes.js";
 import { MongoGraphStore } from "./mongo-graph-store.js";
+import { rebuildOpenPlannerGraph } from "./openplanner-graph.js";
 import { readJsonIfExists, writeJson } from "./persist.js";
 import type { NodePreview } from "./preview.js";
 import { fetchUrlPreview, readFilePreview } from "./preview.js";
@@ -174,7 +176,14 @@ async function main(): Promise<void> {
   const host = process.env.HOST || "0.0.0.0";
   const port = Number(process.env.PORT || "8796");
   const repoRoot = process.env.REPO_ROOT || (await repoRootFromGit(process.cwd())) || process.cwd();
+  const localSourceMode = String(process.env.GRAPH_WEAVER_LOCAL_SOURCE || "repo").trim().toLowerCase();
+  const openPlannerBaseUrl = String(process.env.OPENPLANNER_BASE_URL || "").trim();
+  const openPlannerApiKey = String(process.env.OPENPLANNER_API_KEY || "").trim();
   const webCrawlEnabled = !/^(0|false|no)$/i.test(String(process.env.GRAPH_WEAVER_WEB_CRAWL_ENABLED || "true"));
+  const includeWebLayerWhenIdle = !/^(0|false|no)$/i.test(
+    String(process.env.GRAPH_WEAVER_INCLUDE_WEB_LAYER_WHEN_IDLE || (["openplanner-lakes", "openplanner-graph"].includes(localSourceMode) ? "false" : "true")),
+  );
+  const includeWebLayer = webCrawlEnabled || includeWebLayerWhenIdle;
 
   const vendorWebglDist =
     process.env.WEBGL_GRAPH_VIEW_DIST || path.join(repoRoot, "packages/webgl-graph-view/dist");
@@ -242,6 +251,21 @@ async function main(): Promise<void> {
   // --- revision + WS broadcast + combined cache
   let revision = 0;
   let combinedCache: { revision: number; store: GraphStore } | null = null;
+  let localSync: {
+    ok: boolean;
+    mode: string;
+    lastSuccessfulAt: string | null;
+    lastAttemptAt: string | null;
+    error: string | null;
+    prunedOverlayNodes: number;
+  } = {
+    ok: true,
+    mode: localSourceMode,
+    lastSuccessfulAt: null,
+    lastAttemptAt: null,
+    error: null,
+    prunedOverlayNodes: 0,
+  };
 
   const broadcast = new Set<() => void>();
   const markDirty = () => {
@@ -252,7 +276,7 @@ async function main(): Promise<void> {
 
   const getCombinedStore = (): GraphStore => {
     if (combinedCache && combinedCache.revision === revision) return combinedCache.store;
-    const combined = mergeStoresMany([localStore, webStore, userStore]);
+    const combined = mergeStoresMany(includeWebLayer ? [localStore, webStore, userStore] : [localStore, userStore]);
     combinedCache = { revision, store: combined };
     return combined;
   };
@@ -260,16 +284,86 @@ async function main(): Promise<void> {
   // --- local rebuild (scan)
   let lastSeeds: string[] = [];
 
+  async function pruneStaleOverlayNodes(): Promise<number> {
+    const staleIds: string[] = [];
+    for (const node of userStore.nodes()) {
+      const hasBase = localStore.hasNode(node.id) || (includeWebLayer && webStore.hasNode(node.id));
+      if (hasBase) continue;
+
+      const dataKeys = Object.keys(node.data ?? {});
+      const isLayoutOnlyOverlay = dataKeys.length > 0 && dataKeys.every((key) => key === "pos");
+      if (!isLayoutOnlyOverlay) continue;
+
+      staleIds.push(node.id);
+    }
+
+    if (staleIds.length === 0) return 0;
+
+    for (const id of staleIds) {
+      userStore.removeNode(id);
+    }
+    await mongoGraph.bulkRemoveNodes("user", staleIds);
+    return staleIds.length;
+  }
+
   async function rebuildLocal(): Promise<void> {
+    const attemptedAt = new Date().toISOString();
     const fresh = new GraphStore();
-    const { seeds } = await rebuildLocalGraph({
-      repoRoot,
-      store: fresh,
-      maxFileBytes: config.scan.maxFileBytes,
-    });
-    lastSeeds = seeds;
-    localStore = fresh;
-    markDirty();
+
+    try {
+      const result =
+        localSourceMode === "repo"
+          ? await rebuildLocalGraph({
+              repoRoot,
+              store: fresh,
+              maxFileBytes: config.scan.maxFileBytes,
+            })
+          : localSourceMode === "openplanner-graph"
+            ? await rebuildOpenPlannerGraph({
+                openPlannerBaseUrl,
+                openPlannerApiKey,
+                store: fresh,
+                projects: ["devel", "web", "bluesky"],
+              })
+          : localSourceMode === "openplanner-lakes"
+            ? await rebuildLakeGraph({
+                openPlannerBaseUrl,
+                openPlannerApiKey,
+                store: fresh,
+              })
+            : localSourceMode === "none"
+              ? { seeds: [] }
+              : (() => {
+                  throw new Error(`Unsupported GRAPH_WEAVER_LOCAL_SOURCE: ${localSourceMode}`);
+                })();
+
+      lastSeeds = result.seeds;
+      localStore = fresh;
+      const prunedOverlayNodes = await pruneStaleOverlayNodes();
+      localSync = {
+        ok: true,
+        mode: localSourceMode,
+        lastSuccessfulAt: attemptedAt,
+        lastAttemptAt: attemptedAt,
+        error: null,
+        prunedOverlayNodes,
+      };
+      if (prunedOverlayNodes > 0) {
+        console.log(`[devel-graph-weaver] pruned ${prunedOverlayNodes} stale overlay node(s)`);
+      }
+      markDirty();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      localSync = {
+        ...localSync,
+        ok: false,
+        mode: localSourceMode,
+        lastAttemptAt: attemptedAt,
+        error: message,
+      };
+      console.error(`[devel-graph-weaver] local rebuild failed (mode=${localSourceMode})`, error);
+      throw error;
+    }
   }
 
   // --- weaver
@@ -400,13 +494,15 @@ async function main(): Promise<void> {
       clearInterval(rescanTimer);
     }
     rescanTimer = setInterval(() => {
-      void (async () => {
-        await rebuildLocal();
-        if (webCrawlEnabled) {
-          weaver?.seed(lastSeeds);
-        }
-        markDirty();
-      })();
+      void rebuildLocal()
+        .then(() => {
+          if (webCrawlEnabled) {
+            weaver?.seed(lastSeeds);
+          }
+        })
+        .catch((error) => {
+          console.error("[devel-graph-weaver] scheduled rescan failed", error);
+        });
     }, config.scan.rescanIntervalMs);
   };
   resetRescanTimer();
@@ -419,15 +515,20 @@ async function main(): Promise<void> {
     const maxEdges = Math.max(200, Math.floor(opts?.maxEdges ?? config.render.maxRenderEdges));
 
     const sampled = downsampleSnapshot(combined, { maxNodes, maxEdges });
-    const positions = layoutGraph({
-      nodes: sampled.nodes as unknown as GraphNode[],
-      edges: sampled.edges as unknown as GraphEdge[],
-    });
+    const sampledNodes = sampled.nodes as unknown as GraphNode[];
+    const sampledEdges = sampled.edges as unknown as GraphEdge[];
+    const needsDerivedLayout = sampledNodes.some((node) => !posFromData(node.data));
+    const positions = needsDerivedLayout
+      ? layoutGraph({
+          nodes: sampledNodes,
+          edges: sampledEdges,
+        })
+      : null;
 
     return {
-      nodes: (sampled.nodes as unknown as GraphNode[]).map((n) => {
+      nodes: sampledNodes.map((n) => {
         const override = posFromData(n.data);
-        const p = override ?? positions.get(n.id) ?? { x: 0, y: 0 };
+        const p = override ?? positions?.get(n.id) ?? { x: 0, y: 0 };
         return {
           id: n.id,
           kind: n.kind,
@@ -440,7 +541,7 @@ async function main(): Promise<void> {
           data: n.data,
         };
       }),
-      edges: (sampled.edges as unknown as GraphEdge[]).map((e) => ({
+      edges: sampledEdges.map((e) => ({
         source: e.source,
         target: e.target,
         kind: e.kind,
@@ -464,6 +565,9 @@ async function main(): Promise<void> {
       edges,
       seeds: lastSeeds.length,
       weaver: weaver?.stats() ?? { frontier: 0, inFlight: 0 },
+      localSourceMode,
+      includeWebLayer,
+      localSync,
       webCrawlEnabled,
       render: config.render,
       scan: config.scan,
@@ -538,7 +642,9 @@ async function main(): Promise<void> {
 
     const out: GraphNode[] = [];
     for (const node of getCombinedStore().nodes()) {
-      const hay = `${node.id} ${node.kind} ${node.label} ${(node.path ?? "")} ${(node.url ?? "")} ${(node.dep ?? "")}`.toLowerCase();
+      const lake = typeof node.data?.lake === "string" ? node.data.lake : "";
+      const nodeType = typeof node.data?.node_type === "string" ? node.data.node_type : "";
+      const hay = `${node.id} ${node.kind} ${node.label} ${(node.path ?? "")} ${(node.url ?? "")} ${(node.dep ?? "")} ${lake} ${nodeType}`.toLowerCase();
       if (hay.includes(q)) {
         out.push(node);
         if (out.length >= cap) break;
@@ -578,6 +684,20 @@ async function main(): Promise<void> {
         const url = node.url ?? id.slice("url:".length);
         const p = await fetchUrlPreview({ url, maxBytes, timeoutMs: config.weaver.requestTimeoutMs });
         return { id, kind: node.kind, ...p };
+      }
+
+      const preview = typeof node.data?.preview === "string" ? node.data.preview : null;
+      if (preview) {
+        return {
+          id,
+          kind: node.kind,
+          format: "code",
+          contentType: "text/plain; charset=utf-8",
+          language: null,
+          body: preview,
+          truncated: false,
+          bytes: Buffer.byteLength(preview),
+        };
       }
 
       // deps / other nodes: metadata-only (markdownable)
@@ -894,6 +1014,8 @@ async function main(): Promise<void> {
     console.log(`[devel-graph-weaver] stateDir ${stateDir}`);
     // eslint-disable-next-line no-console
     console.log(`[devel-graph-weaver] mongo ${String(process.env.MONGODB_URI || "mongodb://mongodb:27017").trim()} db=${String(process.env.MONGODB_DB || "devel_graph_weaver").trim()}`);
+    // eslint-disable-next-line no-console
+    console.log(`[devel-graph-weaver] local source ${localSourceMode} · web layer ${includeWebLayer ? "included" : "excluded"}`);
     // eslint-disable-next-line no-console
     console.log(`[devel-graph-weaver] web crawl ${webCrawlEnabled ? "enabled" : "disabled"}`);
   });

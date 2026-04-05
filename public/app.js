@@ -3,6 +3,8 @@ import { WebGLGraphView, rgba } from "/vendor/webgl-graph-view/index.js";
 const canvas = document.getElementById("canvas");
 const statusEl = document.getElementById("status");
 const nodeEl = document.getElementById("node");
+const legendEl = document.getElementById("legend");
+const filtersEl = document.getElementById("filters");
 
 const fitBtn = document.getElementById("fit");
 const reloadBtn = document.getElementById("reload");
@@ -28,6 +30,49 @@ const ui = {
   vRevisit: document.getElementById("v-revisit"),
   vRescan: document.getElementById("v-rescan"),
 };
+
+const LAKE_COLORS = {
+  devel: [0.24, 0.72, 0.98, 0.96],
+  web: [0.39, 0.92, 0.68, 0.96],
+  bluesky: [0.31, 0.63, 0.98, 0.96],
+  misc: [0.7, 0.74, 0.82, 0.94],
+};
+
+const NODE_TYPE_VARIANTS = {
+  docs: { size: 6.2, tint: 0.18 },
+  code: { size: 5.4, tint: -0.02 },
+  config: { size: 5.2, tint: 0.1 },
+  data: { size: 6.0, tint: 0.24 },
+  visited: { size: 5.6, tint: 0.08 },
+  unvisited: { size: 4.8, tint: 0.34 },
+  user: { size: 6.4, tint: -0.08 },
+  post: { size: 5.1, tint: 0.22 },
+  node: { size: 4.8, tint: 0 },
+};
+
+const EDGE_COLORS = {
+  local_markdown_link: [0.97, 0.79, 0.38, 0.24],
+  external_web_link: [0.97, 0.55, 0.34, 0.28],
+  code_dependency: [0.66, 0.52, 0.98, 0.24],
+  visited_to_visited: [0.29, 0.92, 0.63, 0.16],
+  visited_to_unvisited: [0.35, 0.82, 0.57, 0.22],
+  follows_user: [0.41, 0.67, 1.0, 0.2],
+  authored_post: [0.73, 0.57, 0.98, 0.24],
+  shared_post: [0.98, 0.67, 0.41, 0.24],
+  liked_post: [0.98, 0.41, 0.66, 0.24],
+  post_links_visited_web: [0.28, 0.86, 0.94, 0.24],
+  post_links_unvisited_web: [0.2, 0.78, 0.92, 0.3],
+  relation: [0.74, 0.78, 0.9, 0.14],
+};
+
+const filterState = {
+  lakes: null,
+  nodeTypes: null,
+  edgeTypes: null,
+  crossLake: "all",
+};
+
+let fullGraph = null;
 
 function escapeHtml(input) {
   return String(input)
@@ -60,15 +105,63 @@ function parseDataJson(maybeJson) {
   }
 }
 
+function rgbaCss(color) {
+  const [r, g, b, a] = color;
+  return `rgba(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}, ${a})`;
+}
+
+function inferLake(node) {
+  return node?.data?.lake || node?.lake || (String(node?.id || "").split(":", 1)[0] || "misc");
+}
+
+function inferNodeType(node) {
+  return node?.data?.node_type || node?.nodeType || node?.kind || "node";
+}
+
+function inferEdgeType(edge) {
+  return edge?.data?.edge_type || edge?.kind || "relation";
+}
+
+function isCrossLake(edge) {
+  const sourceLake = edge?.data?.source_lake || edge?.sourceLake || edge?.source?.split(":", 1)?.[0];
+  const targetLake = edge?.data?.target_lake || edge?.targetLake || edge?.target?.split(":", 1)?.[0];
+  return Boolean(sourceLake && targetLake && sourceLake !== targetLake);
+}
+
+function lighten(color, amount) {
+  const [r, g, b, a] = color;
+  const mix = (v) => (amount >= 0 ? v + (1 - v) * amount : v * (1 + amount));
+  return [mix(r), mix(g), mix(b), a];
+}
+
+function nodeColor(node) {
+  const lake = inferLake(node);
+  const nodeType = inferNodeType(node);
+  const base = LAKE_COLORS[lake] || LAKE_COLORS.misc;
+  const variant = NODE_TYPE_VARIANTS[nodeType] || NODE_TYPE_VARIANTS.node;
+  return lighten(base, variant.tint || 0);
+}
+
+function nodeSize(node) {
+  const nodeType = inferNodeType(node);
+  return (NODE_TYPE_VARIANTS[nodeType] || NODE_TYPE_VARIANTS.node).size;
+}
+
+function edgeColor(edge) {
+  const edgeType = inferEdgeType(edge);
+  const base = EDGE_COLORS[edgeType] || EDGE_COLORS.relation;
+  return isCrossLake(edge) ? [base[0], base[1], base[2], Math.min(0.34, base[3] + 0.08)] : base;
+}
+
 function shortNode(id) {
   if (!id) return "";
-  if (id.startsWith("file:")) {
-    const rel = id.slice("file:".length);
+  if (id.includes(":file:")) {
+    const rel = id.split(":file:")[1] || id;
     return rel.split("/").slice(-1)[0] || rel;
   }
   if (id.startsWith("dep:")) return id.slice("dep:".length);
-  if (id.startsWith("url:")) {
-    const url = id.slice("url:".length);
+  if (id.includes(":url:")) {
+    const url = id.split(":url:")[1] || id;
     try {
       const u = new URL(url);
       return u.host;
@@ -169,38 +262,25 @@ async function gql(query, variables) {
 
 const view = new WebGLGraphView(canvas, {
   background: rgba(0.03, 0.06, 0.11, 0.98),
+  pulseAmplitude: 0.42,
+  pulseSpeed: 1 / 420,
+  denseNodeThreshold: 4000,
+  denseEdgeThreshold: 16000,
+  dprCap: { normal: 2.5, dense: 2.0 },
+  frameIntervalMs: { normal: 16, dense: 24 },
   onNodeClick: (node) => {
     void selectNodeById(node.id);
   },
   nodeStyle: (node) => {
-    const kind = node.kind || "";
-    if (kind === "file") return { sizePx: 4.8, color: rgba(0.42, 0.82, 0.98, 0.95) };
-    // urls: make them visually distinct from link edges (and from file nodes)
-    if (kind === "url") return { sizePx: 5.8, color: rgba(0.96, 0.46, 0.86, 0.96) };
-    if (kind === "dep") return { sizePx: 5.0, color: rgba(0.95, 0.75, 0.42, 0.95) };
-    return { sizePx: 4.6, color: rgba(0.62, 0.86, 0.9, 0.92) };
+    return { sizePx: nodeSize(node), color: nodeColor(node) };
   },
   edgeStyle: (edge) => {
-    const kind = edge.kind || "";
-
-    // Auto-dim edges when you crank up render edges.
-    // (Without this, 100k+ edges becomes a bright wall and hides the nodes.)
     const aMul = edgeAlphaScale;
-
-    // local structural edges
-    if (kind === "import") return { color: rgba(0.74, 0.58, 0.98, 0.22 * aMul) }; // violet
-    if (kind === "dep") return { color: rgba(0.98, 0.74, 0.36, 0.18 * aMul) }; // amber
-    if (kind === "ref") return { color: rgba(0.42, 0.86, 0.98, 0.16 * aMul) }; // cyan (internal md)
-    if (kind === "link") return { color: rgba(0.32, 0.9, 0.66, 0.14 * aMul) }; // green (file -> url)
-
-    // web weave edges (url -> url)
-    if (kind === "web") return { color: rgba(0.36, 0.94, 0.72, 0.10 * aMul) };
-
-    // user/sim overlay
-    if (kind === "user") return { color: rgba(0.98, 0.56, 0.42, 0.18 * aMul) };
-    if (kind === "observes") return { color: rgba(1.0, 0.92, 0.58, 0.18 * aMul) };
-
-    return { color: rgba(0.68, 0.78, 0.92, 0.08 * aMul) };
+    const color = edgeColor(edge);
+    return {
+      color: rgba(color[0], color[1], color[2], color[3] * aMul),
+      phase: isCrossLake(edge) ? 1.2 : 0,
+    };
   },
 });
 
@@ -216,6 +296,156 @@ let lastMeta = null;
 let lastRenderCounts = { nodes: 0, edges: 0 };
 let lastGraphNodesById = new Map();
 
+function renderLegend(graph) {
+  if (!legendEl) return;
+
+  const lakes = [...new Set(graph.nodes.map((node) => inferLake(node)))].sort();
+  const nodeTypes = [...new Set(graph.nodes.map((node) => inferNodeType(node)))].sort();
+  const edgeTypes = [...new Set(graph.edges.map((edge) => inferEdgeType(edge)))].sort();
+
+  const section = (title, rows) => `
+    <div class="legendSection">
+      <div class="legendTitle">${escapeHtml(title)}</div>
+      <div class="legendItems">${rows.join("\n")}</div>
+    </div>
+  `;
+
+  legendEl.innerHTML = [
+    section(
+      "lakes",
+      lakes.map((lake) => {
+        const color = rgbaCss(LAKE_COLORS[lake] || LAKE_COLORS.misc);
+        return `<div class="legendItem"><span class="swatch" style="background:${escapeAttr(color)}"></span><span>${escapeHtml(lake)}</span></div>`;
+      }),
+    ),
+    section(
+      "node types",
+      nodeTypes.map((nodeType) => {
+        const variant = NODE_TYPE_VARIANTS[nodeType] || NODE_TYPE_VARIANTS.node;
+        return `<div class="legendItem"><span class="swatch swatchNode" style="background:${escapeAttr(rgbaCss(lighten(LAKE_COLORS.devel, variant.tint || 0)))}"></span><span>${escapeHtml(nodeType)}</span></div>`;
+      }),
+    ),
+    section(
+      "edge types",
+      edgeTypes.map((edgeType) => {
+        const color = rgbaCss(EDGE_COLORS[edgeType] || EDGE_COLORS.relation);
+        return `<div class="legendItem"><span class="swatch swatchEdge" style="background:${escapeAttr(color)}"></span><span>${escapeHtml(edgeType)}</span></div>`;
+      }),
+    ),
+    `<div class="legendNote">Cross-lake edges pulse and use brighter strokes.</div>`,
+  ].join("\n");
+}
+
+function ensureFilterSelections(graph) {
+  const lakes = graph.nodes.map((node) => inferLake(node));
+  const nodeTypes = graph.nodes.map((node) => inferNodeType(node));
+  const edgeTypes = graph.edges.map((edge) => inferEdgeType(edge));
+  if (!filterState.lakes) filterState.lakes = new Set(lakes);
+  else lakes.forEach((value) => filterState.lakes.add(value));
+  if (!filterState.nodeTypes) filterState.nodeTypes = new Set(nodeTypes);
+  else nodeTypes.forEach((value) => filterState.nodeTypes.add(value));
+  if (!filterState.edgeTypes) filterState.edgeTypes = new Set(edgeTypes);
+  else edgeTypes.forEach((value) => filterState.edgeTypes.add(value));
+}
+
+function renderFilters(graph) {
+  if (!filtersEl) return;
+  ensureFilterSelections(graph);
+
+  const lakeOptions = [...new Set(graph.nodes.map((node) => inferLake(node)))].sort();
+  const nodeTypeOptions = [...new Set(graph.nodes.map((node) => inferNodeType(node)))].sort();
+  const edgeTypeOptions = [...new Set(graph.edges.map((edge) => inferEdgeType(edge)))].sort();
+
+  const checkbox = (group, value, checked) => `
+    <label class="filterOption">
+      <input type="checkbox" data-filter-group="${escapeAttr(group)}" data-filter-value="${escapeAttr(value)}" ${checked ? "checked" : ""} />
+      <span>${escapeHtml(value)}</span>
+    </label>
+  `;
+
+  filtersEl.innerHTML = `
+    <div class="legendSection">
+      <div class="legendTitle">lakes</div>
+      <div class="filterGroup">${lakeOptions.map((value) => checkbox("lake", value, filterState.lakes.has(value))).join("\n")}</div>
+    </div>
+    <div class="legendSection">
+      <div class="legendTitle">node types</div>
+      <div class="filterGroup">${nodeTypeOptions.map((value) => checkbox("nodeType", value, filterState.nodeTypes.has(value))).join("\n")}</div>
+    </div>
+    <div class="legendSection">
+      <div class="legendTitle">edge types</div>
+      <div class="filterGroup">${edgeTypeOptions.map((value) => checkbox("edgeType", value, filterState.edgeTypes.has(value))).join("\n")}</div>
+    </div>
+    <div class="legendSection">
+      <div class="legendTitle">relations</div>
+      <div class="filterRadios">
+        <label class="filterOption"><input type="radio" name="crossLake" value="all" ${filterState.crossLake === "all" ? "checked" : ""} /> <span>all edges</span></label>
+        <label class="filterOption"><input type="radio" name="crossLake" value="cross" ${filterState.crossLake === "cross" ? "checked" : ""} /> <span>cross-lake only</span></label>
+        <label class="filterOption"><input type="radio" name="crossLake" value="intra" ${filterState.crossLake === "intra" ? "checked" : ""} /> <span>intra-lake only</span></label>
+      </div>
+    </div>
+  `;
+}
+
+function applyGraphFilters() {
+  if (!fullGraph) return;
+
+  const nodes = fullGraph.nodes.filter((node) => filterState.lakes.has(inferLake(node)) && filterState.nodeTypes.has(inferNodeType(node)));
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const edges = fullGraph.edges.filter((edge) => {
+    if (!filterState.edgeTypes.has(inferEdgeType(edge))) return false;
+    if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) return false;
+    if (filterState.crossLake === "cross" && !isCrossLake(edge)) return false;
+    if (filterState.crossLake === "intra" && isCrossLake(edge)) return false;
+    return true;
+  });
+
+  const visibleNodeIds = new Set(nodes.map((node) => node.id));
+  const filteredNodes = nodes.filter((node) => visibleNodeIds.has(node.id));
+
+  lastGraphNodesById = new Map(filteredNodes.map((node) => [node.id, node]));
+  lastRenderCounts = { nodes: filteredNodes.length, edges: edges.length };
+  edgeAlphaScale = edgeAlphaScaleForCount(lastRenderCounts.edges);
+  view.setGraph({ nodes: filteredNodes, edges, meta: fullGraph.meta });
+}
+
+filtersEl?.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement)) return;
+  const group = target.getAttribute("data-filter-group");
+  const value = target.getAttribute("data-filter-value");
+
+  if (group === "lake" && value) {
+    if (target.checked) filterState.lakes.add(value);
+    else filterState.lakes.delete(value);
+    applyGraphFilters();
+    void loadStatus();
+    return;
+  }
+
+  if (group === "nodeType" && value) {
+    if (target.checked) filterState.nodeTypes.add(value);
+    else filterState.nodeTypes.delete(value);
+    applyGraphFilters();
+    void loadStatus();
+    return;
+  }
+
+  if (group === "edgeType" && value) {
+    if (target.checked) filterState.edgeTypes.add(value);
+    else filterState.edgeTypes.delete(value);
+    applyGraphFilters();
+    void loadStatus();
+    return;
+  }
+
+  if (target.name === "crossLake") {
+    filterState.crossLake = target.value || "all";
+    applyGraphFilters();
+    void loadStatus();
+  }
+});
+
 async function loadGraph() {
   const data = await gql(
     `query GraphView {
@@ -229,12 +459,7 @@ async function loadGraph() {
 
   const g = data.graphView;
   lastMeta = g.meta || null;
-  lastRenderCounts = { nodes: g.nodes?.length || 0, edges: g.edges?.length || 0 };
-  edgeAlphaScale = edgeAlphaScaleForCount(lastRenderCounts.edges);
-
-  lastGraphNodesById = new Map(g.nodes.map((n) => [n.id, n]));
-
-  const graph = {
+  fullGraph = {
     nodes: g.nodes.map((n) => ({
       id: n.id,
       kind: n.kind,
@@ -247,33 +472,26 @@ async function loadGraph() {
       source: e.source,
       target: e.target,
       kind: e.kind,
+      data: parseDataJson(e.dataJson) ?? {},
     })),
     meta: g.meta,
   };
 
-  view.setGraph(graph);
+  renderLegend(fullGraph);
+  renderFilters(fullGraph);
+  applyGraphFilters();
 }
 
 async function loadStatus() {
-  const data = await gql(
-    `query Status {
-      status {
-        nodes
-        edges
-        seeds
-        weaver { frontier inFlight }
-        render { maxRenderNodes maxRenderEdges }
-        scan { maxFileBytes rescanIntervalMs }
-      }
-    }`,
-  );
-
-  const s = data.status;
+  const res = await fetch("/api/status");
+  const s = await res.json();
   const sampled =
     lastMeta && (lastMeta.sampledNodes || lastMeta.sampledEdges)
       ? ` · render ${lastRenderCounts.nodes}/${lastMeta.totalNodes} nodes ${lastRenderCounts.edges}/${lastMeta.totalEdges} edges`
       : "";
-  statusEl.textContent = `nodes ${s.nodes} · edges ${s.edges} · seeds ${s.seeds} · weaver frontier ${s.weaver.frontier} · inflight ${s.weaver.inFlight}${sampled}`;
+  const sourceMode = s.localSourceMode ? ` · source ${s.localSourceMode}` : "";
+  const sync = s.localSync?.lastSuccessfulAt ? ` · synced ${new Date(s.localSync.lastSuccessfulAt).toLocaleTimeString()}` : "";
+  statusEl.textContent = `nodes ${s.nodes} · edges ${s.edges} · seeds ${s.seeds} · frontier ${s.weaver.frontier} · inflight ${s.weaver.inFlight}${sourceMode}${sync}${sampled}`;
 }
 
 function bindRange(input, labelEl, format = (v) => String(v)) {
@@ -400,10 +618,13 @@ function renderNodePane(pane) {
   }
 
   const nodeData = parseDataJson(node.dataJson) ?? null;
+  const lake = inferLake({ ...node, data: nodeData || {} });
+  const nodeType = inferNodeType({ ...node, data: nodeData || {} });
 
   const badges = [
+    `<span class="badge">${escapeHtml(lake)}</span>`,
+    `<span class="badge">${escapeHtml(nodeType)}</span>`,
     `<span class="badge">${escapeHtml(node.kind)}</span>`,
-    `<span class="badge">${escapeHtml(node.layer || "unknown")}</span>`,
     node.external ? `<span class="badge">external</span>` : "",
   ].join("");
 
@@ -413,44 +634,30 @@ function renderNodePane(pane) {
     actions.push(`<a href="${escapeAttr(url)}" target="_blank" rel="noreferrer">open url</a>`);
   }
 
-  const importEdges = node.kind === "file" ? edges.filter((e) => e.kind === "import") : [];
-  const depEdges = node.kind === "file" ? edges.filter((e) => e.kind === "dep") : [];
-
-  const importsHtml =
-    importEdges.length > 0
-      ? `
-        <div class="nodeSectionTitle">imports</div>
-        <div class="chips">
-          ${importEdges
-            .slice(0, 200)
-            .map((e) => {
-              const d = parseDataJson(e.dataJson) || {};
-              const spec = typeof d.spec === "string" ? d.spec : "";
-              const label = spec ? `${spec} → ${shortNode(e.target)}` : shortNode(e.target);
-              return edgeChipHtml(e, label);
-            })
-            .join("\n")}
-        </div>
-      `
-      : "";
-
-  const depsHtml =
-    depEdges.length > 0
-      ? `
-        <div class="nodeSectionTitle">deps</div>
-        <div class="chips">
-          ${depEdges
-            .slice(0, 200)
-            .map((e) => {
-              const d = parseDataJson(e.dataJson) || {};
-              const spec = typeof d.spec === "string" ? d.spec : "";
-              const label = spec || shortNode(e.target);
-              return edgeChipHtml(e, label);
-            })
-            .join("\n")}
-        </div>
-      `
-      : "";
+  const relationSections = Object.entries(
+    edges.reduce((acc, edge) => {
+      const key = edge.kind || "relation";
+      acc[key] = acc[key] || [];
+      acc[key].push(edge);
+      return acc;
+    }, {}),
+  )
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([kind, rows]) => `
+      <div class="nodeSectionTitle">${escapeHtml(kind)}</div>
+      <div class="chips">
+        ${rows
+          .slice(0, 200)
+          .map((edge) => {
+            const d = parseDataJson(edge.dataJson) || {};
+            const spec = typeof d.spec === "string" ? d.spec : "";
+            const label = spec ? `${spec} → ${shortNode(edge.target)}` : shortNode(edge.target);
+            return edgeChipHtml(edge, label);
+          })
+          .join("\n")}
+      </div>
+    `)
+    .join("\n");
 
   let bodyHtml = "";
   let previewBadge = "";
@@ -496,8 +703,7 @@ function renderNodePane(pane) {
 
     ${actions.length ? `<div class="nodeActions">${actions.join("\n")}</div>` : ""}
 
-    ${importsHtml}
-    ${depsHtml}
+    ${relationSections}
 
     ${bodyHtml}
 

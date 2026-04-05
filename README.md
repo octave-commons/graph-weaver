@@ -34,6 +34,7 @@ GraphQL:
 - `REPO_ROOT` (default: repo root via `git rev-parse`)
 - `PORT` (default: `8796`)
 - `HOST` (default: `0.0.0.0`)
+- `GRAPH_WEAVER_LOCAL_SOURCE` (default: `repo`) — `repo`, `openplanner-graph`, `openplanner-lakes`, or `none`
 
 - `WEAVER_ANTS` (default: `4`)
 - `WEAVER_DISPATCH_INTERVAL_MS` (default: `15000`)
@@ -44,6 +45,7 @@ Optional:
 - `GRAPH_WEAVER_ADMIN_TOKEN` — if set, GraphQL mutations require `Authorization: Bearer <token>`
 - `STATE_DIR` (default: `.opencode/runtime`) — where config + user-layer graph snapshots are stored
 - `GRAPH_WEAVER_WEB_CRAWL_ENABLED` (default: `true`) — set to `false` when Myrmex owns web crawling and this service should remain a local/UI graph workbench
+- `OPENPLANNER_BASE_URL` / `OPENPLANNER_API_KEY` — required when `GRAPH_WEAVER_LOCAL_SOURCE=openplanner-graph` or `openplanner-lakes`
 
 ## Adjacent repos
 
