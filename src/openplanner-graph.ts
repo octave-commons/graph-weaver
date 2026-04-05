@@ -1,0 +1,115 @@
+import type { GraphEdge, GraphNode } from "./graph.js";
+import { GraphStore } from "./store.js";
+
+type ExportNode = {
+  id: string;
+  kind: string;
+  label: string;
+  lake?: string;
+  nodeType?: string;
+  data?: Record<string, unknown>;
+};
+
+type ExportEdge = {
+  id: string;
+  source: string;
+  target: string;
+  kind: string;
+  lake?: string;
+  edgeType?: string;
+  sourceLake?: string;
+  targetLake?: string;
+  data?: Record<string, unknown>;
+};
+
+type ExportPayload = {
+  ok: boolean;
+  nodes?: ExportNode[];
+  edges?: ExportEdge[];
+};
+
+function trimBaseUrl(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+async function fetchJson<T>(url: string, apiKey?: string): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (apiKey && apiKey.trim()) {
+    headers.authorization = `Bearer ${apiKey.trim()}`;
+  }
+
+  const response = await fetch(url, { headers });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`OpenPlanner graph export failed ${response.status} ${response.statusText}: ${text}`);
+  }
+
+  try {
+    return JSON.parse(text) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`OpenPlanner graph export returned invalid JSON: ${message}`);
+  }
+}
+
+export async function rebuildOpenPlannerGraph(params: {
+  openPlannerBaseUrl: string;
+  openPlannerApiKey?: string;
+  store: GraphStore;
+  projects?: string[];
+}): Promise<{ seeds: string[] }> {
+  const baseUrl = trimBaseUrl(params.openPlannerBaseUrl || "");
+  if (!baseUrl) {
+    throw new Error("GRAPH_WEAVER_LOCAL_SOURCE=openplanner-graph requires OPENPLANNER_BASE_URL");
+  }
+
+  const projects = (params.projects ?? ["devel", "web", "bluesky"]).filter(Boolean);
+  const query = projects.length > 0 ? `?projects=${encodeURIComponent(projects.join(","))}` : "";
+  const payload = await fetchJson<ExportPayload>(`${baseUrl}/v1/graph/export${query}`, params.openPlannerApiKey);
+
+  const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
+  const edges = Array.isArray(payload.edges) ? payload.edges : [];
+
+  for (const node of nodes) {
+    const data = {
+      ...(node.data ?? {}),
+      lake: node.lake ?? (node.data as any)?.lake,
+      node_type: node.nodeType ?? (node.data as any)?.node_type,
+    } as Record<string, unknown>;
+
+    const graphNode: GraphNode = {
+      id: node.id,
+      kind: node.kind,
+      label: node.label,
+      external: node.lake !== "devel",
+      loadedByDefault: true,
+      layer: "local",
+      path: typeof data.path === "string" ? data.path : undefined,
+      url: typeof data.url === "string" ? data.url : undefined,
+      data,
+    };
+    params.store.upsertNode(graphNode);
+  }
+
+  for (const edge of edges) {
+    const data = {
+      ...(edge.data ?? {}),
+      lake: edge.lake ?? (edge.data as any)?.lake,
+      edge_type: edge.edgeType ?? (edge.data as any)?.edge_type,
+      source_lake: edge.sourceLake ?? (edge.data as any)?.source_lake,
+      target_lake: edge.targetLake ?? (edge.data as any)?.target_lake,
+    } as Record<string, unknown>;
+
+    const graphEdge: GraphEdge = {
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      kind: edge.kind,
+      layer: "local",
+      data,
+    };
+    params.store.upsertEdge(graphEdge);
+  }
+
+  return { seeds: [] };
+}
