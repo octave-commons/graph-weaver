@@ -15,7 +15,7 @@ import { repoRootFromGit } from "./git.js";
 import { layoutGraph } from "./layout.js";
 import { rebuildLakeGraph } from "./lakes.js";
 import { MongoGraphStore } from "./mongo-graph-store.js";
-import { rebuildOpenPlannerGraph } from "./openplanner-graph.js";
+import { rebuildOpenPlannerGraph, upsertOpenPlannerGraphLayout } from "./openplanner-graph.js";
 import { readJsonIfExists, writeJson } from "./persist.js";
 import type { NodePreview } from "./preview.js";
 import { fetchUrlPreview, readFilePreview } from "./preview.js";
@@ -179,11 +179,21 @@ async function main(): Promise<void> {
   const localSourceMode = String(process.env.GRAPH_WEAVER_LOCAL_SOURCE || "repo").trim().toLowerCase();
   const openPlannerBaseUrl = String(process.env.OPENPLANNER_BASE_URL || "").trim();
   const openPlannerApiKey = String(process.env.OPENPLANNER_API_KEY || "").trim();
+  const openPlannerProjects = String(process.env.GRAPH_WEAVER_OPENPLANNER_PROJECTS || "devel,web,bluesky,knoxx-session")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const requestedPersistenceMode = String(process.env.GRAPH_WEAVER_PERSISTENCE_MODE || "").trim().toLowerCase();
   const webCrawlEnabled = !/^(0|false|no)$/i.test(String(process.env.GRAPH_WEAVER_WEB_CRAWL_ENABLED || "true"));
   const includeWebLayerWhenIdle = !/^(0|false|no)$/i.test(
     String(process.env.GRAPH_WEAVER_INCLUDE_WEB_LAYER_WHEN_IDLE || (["openplanner-lakes", "openplanner-graph"].includes(localSourceMode) ? "false" : "true")),
   );
   const includeWebLayer = webCrawlEnabled || includeWebLayerWhenIdle;
+  const graphPersistenceMode = (() => {
+    if (requestedPersistenceMode === "mongo" || requestedPersistenceMode === "openplanner") return requestedPersistenceMode;
+    if (localSourceMode === "openplanner-graph") return "openplanner";
+    return "mongo";
+  })();
 
   const vendorWebglDist =
     process.env.WEBGL_GRAPH_VIEW_DIST || path.join(repoRoot, "packages/webgl-graph-view/dist");
@@ -193,12 +203,16 @@ async function main(): Promise<void> {
   const configPath = path.join(stateDir, "devel-graph-weaver.config.json");
   const legacyUserGraphPath = path.join(stateDir, "devel-graph-weaver.user-graph.json");
 
-  const mongoGraph = new MongoGraphStore({
-    uri: String(process.env.MONGODB_URI || "mongodb://mongodb:27017").trim(),
-    dbName: String(process.env.MONGODB_DB || "devel_graph_weaver").trim(),
-    appName: "devel-graph-weaver",
-  });
-  await mongoGraph.connect();
+  const mongoGraph = graphPersistenceMode === "mongo"
+    ? new MongoGraphStore({
+        uri: String(process.env.MONGODB_URI || "mongodb://mongodb:27017").trim(),
+        dbName: String(process.env.MONGODB_DB || "devel_graph_weaver").trim(),
+        appName: "devel-graph-weaver",
+      })
+    : null;
+  if (mongoGraph) {
+    await mongoGraph.connect();
+  }
 
   // --- config
   let config: RuntimeConfig = defaultConfigFromEnv(process.env);
@@ -226,24 +240,26 @@ async function main(): Promise<void> {
     for (const edge of snapshot.edges) store.upsertEdge(edge);
   };
 
-  // persisted graph load (MongoDB datalake)
-  loadSnapshotIntoStore(webStore, await mongoGraph.loadStore("web"));
+  if (mongoGraph) {
+    // persisted graph load (MongoDB datalake)
+    loadSnapshotIntoStore(webStore, await mongoGraph.loadStore("web"));
 
-  const storedUser = await mongoGraph.loadStore("user");
-  if (storedUser.nodes.length > 0 || storedUser.edges.length > 0) {
-    loadSnapshotIntoStore(userStore, storedUser);
-  } else {
-    // one-time legacy migration from the old JSON snapshot, if it exists and parses.
-    const legacyUser = await readJsonIfExists<GraphSnapshot>(legacyUserGraphPath);
-    if (legacyUser?.nodes && legacyUser?.edges) {
-      loadSnapshotIntoStore(userStore, legacyUser);
-      await mongoGraph.bulkUpsertNodes("user", legacyUser.nodes);
-      await mongoGraph.bulkUpsertEdges("user", legacyUser.edges);
+    const storedUser = await mongoGraph.loadStore("user");
+    if (storedUser.nodes.length > 0 || storedUser.edges.length > 0) {
+      loadSnapshotIntoStore(userStore, storedUser);
+    } else {
+      // one-time legacy migration from the old JSON snapshot, if it exists and parses.
+      const legacyUser = await readJsonIfExists<GraphSnapshot>(legacyUserGraphPath);
+      if (legacyUser?.nodes && legacyUser?.edges) {
+        loadSnapshotIntoStore(userStore, legacyUser);
+        await mongoGraph.bulkUpsertNodes("user", legacyUser.nodes);
+        await mongoGraph.bulkUpsertEdges("user", legacyUser.edges);
 
-      try {
-        await fs.rename(legacyUserGraphPath, `${legacyUserGraphPath}.migrated`);
-      } catch {
-        // ignore: non-fatal if rename fails or file doesn't exist.
+        try {
+          await fs.rename(legacyUserGraphPath, `${legacyUserGraphPath}.migrated`);
+        } catch {
+          // ignore: non-fatal if rename fails or file doesn't exist.
+        }
       }
     }
   }
@@ -251,6 +267,32 @@ async function main(): Promise<void> {
   // --- revision + WS broadcast + combined cache
   let revision = 0;
   let combinedCache: { revision: number; store: GraphStore } | null = null;
+  const graphViewCache = new Map<string, {
+    nodes: Array<{
+      id: string;
+      kind: string;
+      label: string;
+      x: number;
+      y: number;
+      external: boolean;
+      loadedByDefault: boolean;
+      layer?: GraphNode["layer"];
+      data?: GraphNode["data"];
+    }>;
+    edges: Array<{
+      source: string;
+      target: string;
+      kind: string;
+      layer?: GraphEdge["layer"];
+      data?: GraphEdge["data"];
+    }>;
+    meta: {
+      totalNodes: number;
+      totalEdges: number;
+      sampledNodes: boolean;
+      sampledEdges: boolean;
+    };
+  }>();
   let localSync: {
     ok: boolean;
     mode: string;
@@ -268,10 +310,54 @@ async function main(): Promise<void> {
   };
 
   const broadcast = new Set<() => void>();
+  const pendingUserNodeFlush = new Map<string, GraphNode>();
+  let userNodeFlushTimer: ReturnType<typeof setTimeout> | null = null;
   const markDirty = () => {
     revision += 1;
     combinedCache = null;
+    graphViewCache.clear();
     for (const cb of broadcast) cb();
+  };
+
+  const flushUserNodeWrites = async () => {
+    const batch = [...pendingUserNodeFlush.values()];
+    pendingUserNodeFlush.clear();
+    if (batch.length === 0) return;
+    if (mongoGraph) {
+      await mongoGraph.bulkUpsertNodes("user", batch);
+      return;
+    }
+
+    const inputs = batch
+      .map((node) => {
+        const pos = posFromData(node.data);
+        if (!pos) return null;
+        return { id: node.id, x: pos.x, y: pos.y };
+      })
+      .filter((row): row is { id: string; x: number; y: number } => !!row);
+
+    if (inputs.length > 0) {
+      await upsertOpenPlannerGraphLayout({
+        openPlannerBaseUrl,
+        openPlannerApiKey,
+        source: "graph-weaver",
+        layoutVersion: "v1",
+        inputs,
+      });
+    }
+  };
+
+  const scheduleUserNodeFlush = (nodes: GraphNode[]) => {
+    for (const node of nodes) {
+      pendingUserNodeFlush.set(node.id, node);
+    }
+    if (userNodeFlushTimer) return;
+    userNodeFlushTimer = setTimeout(() => {
+      userNodeFlushTimer = null;
+      void flushUserNodeWrites().catch((error) => {
+        console.error("[devel-graph-weaver] failed to persist queued user node positions", error);
+      });
+    }, 1000);
   };
 
   const getCombinedStore = (): GraphStore => {
@@ -302,7 +388,9 @@ async function main(): Promise<void> {
     for (const id of staleIds) {
       userStore.removeNode(id);
     }
-    await mongoGraph.bulkRemoveNodes("user", staleIds);
+    if (mongoGraph) {
+      await mongoGraph.bulkRemoveNodes("user", staleIds);
+    }
     return staleIds.length;
   }
 
@@ -323,7 +411,7 @@ async function main(): Promise<void> {
                 openPlannerBaseUrl,
                 openPlannerApiKey,
                 store: fresh,
-                projects: ["devel", "web", "bluesky"],
+                projects: openPlannerProjects,
               })
           : localSourceMode === "openplanner-lakes"
             ? await rebuildLakeGraph({
@@ -418,13 +506,15 @@ async function main(): Promise<void> {
         touchedEdges.push(outEdge);
       }
 
-      void (async () => {
-        await mongoGraph.bulkUpsertNodes("web", touchedNodes);
-        await mongoGraph.bulkUpsertEdges("web", touchedEdges);
-      })().catch((err) => {
-        // eslint-disable-next-line no-console
-        console.error("[devel-graph-weaver] failed to persist web page event", err);
-      });
+      if (mongoGraph) {
+        void (async () => {
+          await mongoGraph.bulkUpsertNodes("web", touchedNodes);
+          await mongoGraph.bulkUpsertEdges("web", touchedEdges);
+        })().catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error("[devel-graph-weaver] failed to persist web page event", err);
+        });
+      }
 
       markDirty();
       return;
@@ -443,10 +533,12 @@ async function main(): Promise<void> {
         data: { url: ev.url, error: ev.message, fetchedAt: ev.fetchedAt },
       };
       webStore.upsertNode(errorNode);
-      void mongoGraph.upsertNode("web", errorNode).catch((err) => {
-        // eslint-disable-next-line no-console
-        console.error("[devel-graph-weaver] failed to persist web error event", err);
-      });
+      if (mongoGraph) {
+        void mongoGraph.upsertNode("web", errorNode).catch((err) => {
+          // eslint-disable-next-line no-console
+          console.error("[devel-graph-weaver] failed to persist web error event", err);
+        });
+      }
       markDirty();
     }
   };
@@ -509,10 +601,13 @@ async function main(): Promise<void> {
 
   // --- graph view
   const buildGraphView = (opts?: { maxNodes?: number; maxEdges?: number }) => {
-    const combined = getCombinedStore().snapshot();
-
     const maxNodes = Math.max(200, Math.floor(opts?.maxNodes ?? config.render.maxRenderNodes));
     const maxEdges = Math.max(200, Math.floor(opts?.maxEdges ?? config.render.maxRenderEdges));
+    const cacheKey = `${revision}:${maxNodes}:${maxEdges}`;
+    const cached = graphViewCache.get(cacheKey);
+    if (cached) return cached;
+
+    const combined = getCombinedStore().snapshot();
 
     const sampled = downsampleSnapshot(combined, { maxNodes, maxEdges });
     const sampledNodes = sampled.nodes as unknown as GraphNode[];
@@ -525,7 +620,7 @@ async function main(): Promise<void> {
         })
       : null;
 
-    return {
+    const view = {
       nodes: sampledNodes.map((n) => {
         const override = posFromData(n.data);
         const p = override ?? positions?.get(n.id) ?? { x: 0, y: 0 };
@@ -555,6 +650,9 @@ async function main(): Promise<void> {
         sampledEdges: sampled.sampledEdges,
       },
     };
+
+    graphViewCache.set(cacheKey, view);
+    return view;
   };
 
   const getStatus = () => {
@@ -585,72 +683,15 @@ async function main(): Promise<void> {
   };
 
   const listEdges = (filter: { source?: string; target?: string; kind?: string; limit: number }) => {
-    const out: GraphEdge[] = [];
-    const cap = Math.max(1, Math.min(2000, Math.floor(filter.limit)));
-    const kind = filter.kind;
-    for (const edge of getCombinedStore().edges()) {
-      if (filter.source && edge.source !== filter.source) continue;
-      if (filter.target && edge.target !== filter.target) continue;
-      if (kind && edge.kind !== kind) continue;
-      out.push(edge);
-      if (out.length >= cap) break;
-    }
-    return out;
+    return getCombinedStore().listEdges(filter);
   };
 
   const neighbors = (filter: { id: string; direction: "in" | "out" | "both"; kind?: string; limit: number }) => {
-    const out: GraphNode[] = [];
-    const cap = Math.max(1, Math.min(2000, Math.floor(filter.limit)));
-
-    const seen = new Set<string>();
-    for (const edge of getCombinedStore().edges()) {
-      if (filter.kind && edge.kind !== filter.kind) continue;
-      if (filter.direction === "out" || filter.direction === "both") {
-        if (edge.source === filter.id) {
-          const id = edge.target;
-          if (!seen.has(id)) {
-            const node = getCombinedStore().getNode(id);
-            if (node) {
-              out.push(node);
-              seen.add(id);
-              if (out.length >= cap) break;
-            }
-          }
-        }
-      }
-      if (filter.direction === "in" || filter.direction === "both") {
-        if (edge.target === filter.id) {
-          const id = edge.source;
-          if (!seen.has(id)) {
-            const node = getCombinedStore().getNode(id);
-            if (node) {
-              out.push(node);
-              seen.add(id);
-              if (out.length >= cap) break;
-            }
-          }
-        }
-      }
-    }
-    return out;
+    return getCombinedStore().neighbors(filter);
   };
 
   const searchNodes = (query: string, limit: number) => {
-    const q = String(query || "").trim().toLowerCase();
-    if (!q) return [];
-    const cap = Math.max(1, Math.min(500, Math.floor(limit)));
-
-    const out: GraphNode[] = [];
-    for (const node of getCombinedStore().nodes()) {
-      const lake = typeof node.data?.lake === "string" ? node.data.lake : "";
-      const nodeType = typeof node.data?.node_type === "string" ? node.data.node_type : "";
-      const hay = `${node.id} ${node.kind} ${node.label} ${(node.path ?? "")} ${(node.url ?? "")} ${(node.dep ?? "")} ${lake} ${nodeType}`.toLowerCase();
-      if (hay.includes(q)) {
-        out.push(node);
-        if (out.length >= cap) break;
-      }
-    }
-    return out;
+    return getCombinedStore().searchNodes(query, limit);
   };
 
   const nodePreview = async (id: string, maxBytes: number): Promise<NodePreview | null> => {
@@ -774,7 +815,20 @@ async function main(): Promise<void> {
     };
     userStore.upsertNode(node);
     const stored = userStore.getNode(node.id)!;
-    await mongoGraph.upsertNode("user", stored);
+    if (mongoGraph) {
+      await mongoGraph.upsertNode("user", stored);
+    } else {
+      const pos = posFromData(stored.data);
+      if (pos) {
+        await upsertOpenPlannerGraphLayout({
+          openPlannerBaseUrl,
+          openPlannerApiKey,
+          source: "graph-weaver",
+          layoutVersion: "v1",
+          inputs: [{ id: stored.id, x: pos.x, y: pos.y }],
+        });
+      }
+    }
     markDirty();
     return stored;
   };
@@ -815,7 +869,7 @@ async function main(): Promise<void> {
     }
 
     if (updated > 0) {
-      await mongoGraph.bulkUpsertNodes("user", touched);
+      scheduleUserNodeFlush(touched);
       markDirty();
     }
     return updated;
@@ -843,8 +897,10 @@ async function main(): Promise<void> {
     userStore.upsertEdge(edge);
     const writes: Promise<void>[] = [];
     const touchedNodes = [createdA, createdB].filter((node): node is GraphNode => !!node);
-    if (touchedNodes.length > 0) writes.push(mongoGraph.bulkUpsertNodes("user", touchedNodes));
-    writes.push(mongoGraph.upsertEdge("user", userStore.getEdge(edge.id)!));
+    if (mongoGraph) {
+      if (touchedNodes.length > 0) writes.push(mongoGraph.bulkUpsertNodes("user", touchedNodes));
+      writes.push(mongoGraph.upsertEdge("user", userStore.getEdge(edge.id)!));
+    }
     await Promise.all(writes);
     markDirty();
     return userStore.getEdge(edge.id)!;
@@ -852,8 +908,10 @@ async function main(): Promise<void> {
 
   const removeUserNode = async (id: string): Promise<boolean> => {
     const ok = userStore.removeNode(id);
-    if (ok) {
+    if (ok && mongoGraph) {
       await mongoGraph.removeNode("user", id);
+      markDirty();
+    } else if (ok) {
       markDirty();
     }
     return ok;
@@ -861,8 +919,10 @@ async function main(): Promise<void> {
 
   const removeUserEdge = async (id: string): Promise<boolean> => {
     const ok = userStore.removeEdge(id);
-    if (ok) {
+    if (ok && mongoGraph) {
       await mongoGraph.removeEdge("user", id);
+      markDirty();
+    } else if (ok) {
       markDirty();
     }
     return ok;
@@ -992,7 +1052,13 @@ async function main(): Promise<void> {
   const shutdown = (signal: string) => {
     // eslint-disable-next-line no-console
     console.log(`[devel-graph-weaver] shutting down on ${signal}`);
-    void mongoGraph.close().catch(() => {});
+    if (userNodeFlushTimer) clearTimeout(userNodeFlushTimer);
+    if (pendingUserNodeFlush.size > 0) {
+      void flushUserNodeWrites().catch(() => {});
+    }
+    if (mongoGraph) {
+      void mongoGraph.close().catch(() => {});
+    }
     if (rescanTimer) clearInterval(rescanTimer);
     try {
       wss.close();
@@ -1013,7 +1079,11 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[devel-graph-weaver] stateDir ${stateDir}`);
     // eslint-disable-next-line no-console
-    console.log(`[devel-graph-weaver] mongo ${String(process.env.MONGODB_URI || "mongodb://mongodb:27017").trim()} db=${String(process.env.MONGODB_DB || "devel_graph_weaver").trim()}`);
+    if (mongoGraph) {
+      console.log(`[devel-graph-weaver] mongo ${String(process.env.MONGODB_URI || "mongodb://mongodb:27017").trim()} db=${String(process.env.MONGODB_DB || "devel_graph_weaver").trim()}`);
+    } else {
+      console.log(`[devel-graph-weaver] persistence ${graphPersistenceMode} -> ${openPlannerBaseUrl || "(missing OPENPLANNER_BASE_URL)"}`);
+    }
     // eslint-disable-next-line no-console
     console.log(`[devel-graph-weaver] local source ${localSourceMode} · web layer ${includeWebLayer ? "included" : "excluded"}`);
     // eslint-disable-next-line no-console

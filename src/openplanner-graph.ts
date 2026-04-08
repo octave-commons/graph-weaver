@@ -32,13 +32,16 @@ function trimBaseUrl(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-async function fetchJson<T>(url: string, apiKey?: string): Promise<T> {
+function authHeaders(apiKey?: string): Record<string, string> {
   const headers: Record<string, string> = {};
   if (apiKey && apiKey.trim()) {
     headers.authorization = `Bearer ${apiKey.trim()}`;
   }
+  return headers;
+}
 
-  const response = await fetch(url, { headers });
+async function fetchJson<T>(url: string, apiKey?: string): Promise<T> {
+  const response = await fetch(url, { headers: authHeaders(apiKey) });
   const text = await response.text();
   if (!response.ok) {
     throw new Error(`OpenPlanner graph export failed ${response.status} ${response.statusText}: ${text}`);
@@ -64,7 +67,10 @@ export async function rebuildOpenPlannerGraph(params: {
   }
 
   const projects = (params.projects ?? ["devel", "web", "bluesky"]).filter(Boolean);
-  const query = projects.length > 0 ? `?projects=${encodeURIComponent(projects.join(","))}` : "";
+  const qs = new URLSearchParams();
+  if (projects.length > 0) qs.set("projects", projects.join(","));
+  qs.set("includeLayout", "true");
+  const query = `?${qs.toString()}`;
   const payload = await fetchJson<ExportPayload>(`${baseUrl}/v1/graph/export${query}`, params.openPlannerApiKey);
 
   const nodes = Array.isArray(payload.nodes) ? payload.nodes : [];
@@ -112,4 +118,44 @@ export async function rebuildOpenPlannerGraph(params: {
   }
 
   return { seeds: [] };
+}
+
+export async function upsertOpenPlannerGraphLayout(params: {
+  openPlannerBaseUrl: string;
+  openPlannerApiKey?: string;
+  source?: string;
+  layoutVersion?: string;
+  inputs: Array<{ id: string; x: number; y: number }>;
+}): Promise<number> {
+  const baseUrl = trimBaseUrl(params.openPlannerBaseUrl || "");
+  if (!baseUrl) {
+    throw new Error("GRAPH_WEAVER_PERSISTENCE_MODE=openplanner requires OPENPLANNER_BASE_URL");
+  }
+
+  const response = await fetch(`${baseUrl}/v1/graph/layout/upsert`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...authHeaders(params.openPlannerApiKey),
+    },
+    body: JSON.stringify({
+      source: params.source ?? "graph-weaver",
+      layoutVersion: params.layoutVersion ?? "v1",
+      inputs: params.inputs,
+    }),
+  });
+
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`OpenPlanner layout upsert failed ${response.status} ${response.statusText}: ${text}`);
+  }
+
+  try {
+    const payload = JSON.parse(text) as { stored?: unknown; validated?: unknown };
+    if (typeof payload.stored === "number") return payload.stored;
+    if (typeof payload.validated === "number") return payload.validated;
+    return params.inputs.length;
+  } catch {
+    return params.inputs.length;
+  }
 }

@@ -207,6 +207,8 @@ const schema = buildSchema(`
     edge(id: ID!): Edge
     """Fetch a preview payload for a node (file head / url head)."""
     nodePreview(id: ID!, maxBytes: Int = 200000): NodePreview
+    """Fetch preview payloads for many nodes in one request."""
+    nodePreviews(ids: [ID!]!, maxBytes: Int = 200000): [NodePreview]
     edges(source: ID, target: ID, kind: String, limit: Int = 200): [Edge!]!
     neighbors(id: ID!, direction: String = "both", kind: String, limit: Int = 200): [Node!]!
     searchNodes(query: String!, limit: Int = 50): [Node!]!
@@ -493,6 +495,12 @@ export function createGraphQLHandler(state: GraphQLState) {
     nodePreview: async (args: { id: string; maxBytes?: number | null }, _ctx: GraphQLContext) => {
       const maxBytes = Math.max(1024, Math.min(2_000_000, Math.floor(Number(args.maxBytes ?? 200_000))));
       return await state.nodePreview(args.id, maxBytes);
+    },
+
+    nodePreviews: async (args: { ids: string[]; maxBytes?: number | null }, _ctx: GraphQLContext) => {
+      const maxBytes = Math.max(1024, Math.min(2_000_000, Math.floor(Number(args.maxBytes ?? 200_000))));
+      const ids = Array.isArray(args.ids) ? args.ids.map((id) => String(id || "")).filter(Boolean) : [];
+      return await Promise.all(ids.map((id) => state.nodePreview(id, maxBytes)));
     },
 
     edge: (args: { id: string }, _ctx: GraphQLContext) => {
