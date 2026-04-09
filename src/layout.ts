@@ -1,4 +1,4 @@
-import type { GraphSnapshot } from "./graph.js";
+import type { GraphNode, GraphSnapshot } from "./graph.js";
 
 function hash32(input: string): number {
   let h = 0x811c9dc5;
@@ -9,50 +9,74 @@ function hash32(input: string): number {
   return h >>> 0;
 }
 
-function groupKey(nodeId: string): string {
-  if (nodeId.startsWith("file:")) {
-    const rest = nodeId.slice("file:".length);
-    const parts = rest.split("/");
-    const a = parts[0] || "root";
-    const b = parts[1] || "";
-
-    // Split the biggest buckets into sub-groups so we don't get one mega-clump.
-    if (a === "orgs" && b) return `orgs/${b}`;
-    if (a === "packages" && b) return `packages/${b}`;
-    if (a === "services" && b) return `services/${b}`;
-
-    return a;
-  }
-  if (nodeId.startsWith("url:")) {
-    try {
-      return new URL(nodeId.slice("url:".length)).host;
-    } catch {
-      return "web";
-    }
-  }
-  if (nodeId.startsWith("dep:")) return "deps";
+function lakeKey(node: GraphNode): string {
+  const lake = node.data?.lake;
+  if (typeof lake === "string" && lake.trim()) return lake.trim();
+  if (node.id.includes(":")) return node.id.split(":", 1)[0] || "misc";
   return "misc";
+}
+
+function subtypeKey(node: GraphNode): string {
+  const nodeType = node.data?.node_type;
+  if (typeof nodeType === "string" && nodeType.trim()) return nodeType.trim();
+  if (node.kind) return node.kind;
+  return "node";
+}
+
+function groupKey(node: GraphNode): string {
+  return `${lakeKey(node)}::${subtypeKey(node)}`;
+}
+
+function lakeAnchor(lake: string, index: number, total: number): { x: number; y: number } {
+  const canonical = ["devel", "web", "bluesky"];
+  const canonicalIdx = canonical.indexOf(lake);
+  if (canonicalIdx >= 0) {
+    return {
+      x: (canonicalIdx - 1) * 1100,
+      y: 0,
+    };
+  }
+
+  const radius = 1300;
+  const angle = (Math.PI * 2 * index) / Math.max(1, total);
+  return { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius * 0.75 };
 }
 
 export function layoutGraph(snapshot: GraphSnapshot): Map<string, { x: number; y: number }> {
   const nodes = snapshot.nodes;
   const groups = new Map<string, string[]>();
+  const groupMeta = new Map<string, { lake: string; subtype: string }>();
   for (const n of nodes) {
-    const key = groupKey(n.id);
+    const key = groupKey(n);
     const arr = groups.get(key) ?? [];
     arr.push(n.id);
     groups.set(key, arr);
+    groupMeta.set(key, { lake: lakeKey(n), subtype: subtypeKey(n) });
   }
 
   const keys = [...groups.keys()].sort((a, b) => a.localeCompare(b));
   const anchors = new Map<string, { x: number; y: number }>();
 
-  // Larger ring when there are many groups.
-  const count = Math.max(1, keys.length);
-  const ring = 360 + Math.min(760, Math.sqrt(count) * 46);
-  keys.forEach((k, i) => {
-    const a = (Math.PI * 2 * i) / count;
-    anchors.set(k, { x: Math.cos(a) * ring, y: Math.sin(a) * ring * 0.78 });
+  const lakes = [...new Set(keys.map((key) => groupMeta.get(key)?.lake || "misc"))].sort((a, b) => a.localeCompare(b));
+  const byLake = new Map<string, string[]>();
+  for (const key of keys) {
+    const lake = groupMeta.get(key)?.lake || "misc";
+    const arr = byLake.get(lake) ?? [];
+    arr.push(key);
+    byLake.set(lake, arr);
+  }
+
+  lakes.forEach((lake, lakeIndex) => {
+    const base = lakeAnchor(lake, lakeIndex, lakes.length);
+    const lakeGroups = (byLake.get(lake) ?? []).sort((a, b) => a.localeCompare(b));
+    const count = Math.max(1, lakeGroups.length);
+    lakeGroups.forEach((key, index) => {
+      const band = index - (count - 1) / 2;
+      anchors.set(key, {
+        x: base.x,
+        y: base.y + band * 300,
+      });
+    });
   });
 
   const positions = new Map<string, { x: number; y: number }>();

@@ -263,6 +263,56 @@ canvas {
   gap: 0.75rem;
 }
 
+.legendSection {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.legendTitle {
+  font-size: 0.72rem;
+  color: rgba(255, 255, 255, 0.58);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.legendItems,
+.filterGroup {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.legendItem,
+.filterOption {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8rem;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.swatch {
+  display: inline-flex;
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 0.28rem;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18) inset;
+}
+
+.swatchEdge {
+  height: 0.28rem;
+  border-radius: 999px;
+}
+
+.legendNote {
+  font-size: 0.76rem;
+  color: rgba(255, 255, 255, 0.62);
+}
+
+.filterOption input {
+  margin: 0;
+}
+
 .row label {
   display: flex;
   justify-content: space-between;

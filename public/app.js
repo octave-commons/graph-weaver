@@ -3,6 +3,8 @@ import { WebGLGraphView, rgba } from "/vendor/webgl-graph-view/index.js";
 const canvas = document.getElementById("canvas");
 const statusEl = document.getElementById("status");
 const nodeEl = document.getElementById("node");
+const legendEl = document.getElementById("legend");
+const filtersEl = document.getElementById("filters");
 
 const fitBtn = document.getElementById("fit");
 const reloadBtn = document.getElementById("reload");
@@ -28,6 +30,39 @@ const ui = {
   vRevisit: document.getElementById("v-revisit"),
   vRescan: document.getElementById("v-rescan"),
 };
+
+const LAYER_COLORS = {
+  local: [0.42, 0.82, 0.98, 0.95],
+  web: [0.36, 0.94, 0.72, 0.94],
+  user: [0.98, 0.56, 0.42, 0.94],
+  unknown: [0.68, 0.78, 0.92, 0.88],
+};
+
+const NODE_STYLES = {
+  file: { sizePx: 4.8, color: [0.42, 0.82, 0.98, 0.95] },
+  url: { sizePx: 5.8, color: [0.96, 0.46, 0.86, 0.96] },
+  dep: { sizePx: 5.0, color: [0.95, 0.75, 0.42, 0.95] },
+  default: { sizePx: 4.6, color: [0.62, 0.86, 0.9, 0.92] },
+};
+
+const EDGE_COLORS = {
+  import: [0.74, 0.58, 0.98, 0.22],
+  dep: [0.98, 0.74, 0.36, 0.18],
+  ref: [0.42, 0.86, 0.98, 0.16],
+  link: [0.32, 0.9, 0.66, 0.14],
+  web: [0.36, 0.94, 0.72, 0.1],
+  user: [0.98, 0.56, 0.42, 0.18],
+  observes: [1.0, 0.92, 0.58, 0.18],
+  default: [0.68, 0.78, 0.92, 0.08],
+};
+
+const filterState = {
+  layers: null,
+  nodeKinds: null,
+  edgeKinds: null,
+};
+
+let fullGraph = null;
 
 function escapeHtml(input) {
   return String(input)
@@ -58,6 +93,32 @@ function parseDataJson(maybeJson) {
   } catch {
     return { note: "invalid json", raw: maybeJson };
   }
+}
+
+function rgbaCss(color) {
+  const [r, g, b, a] = color;
+  return `rgba(${Math.round(r * 255)}, ${Math.round(g * 255)}, ${Math.round(b * 255)}, ${a})`;
+}
+
+function inferLayer(item) {
+  return item?.layer || item?.data?.layer || "unknown";
+}
+
+function inferNodeKind(node) {
+  return node?.kind || "node";
+}
+
+function inferEdgeKind(edge) {
+  return edge?.kind || "relation";
+}
+
+function nodeStyleForKind(kind) {
+  return NODE_STYLES[kind] || NODE_STYLES.default;
+}
+
+function edgeColorForKind(kind, alphaScale = 1) {
+  const [r, g, b, a] = EDGE_COLORS[kind] || EDGE_COLORS.default;
+  return [r, g, b, a * alphaScale];
 }
 
 function shortNode(id) {
@@ -105,7 +166,9 @@ function htmlToMarkdown(html, baseUrl) {
   const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
 
   // remove noisy / unsafe blocks before conversion
-  doc.querySelectorAll("script,style,noscript").forEach((el) => el.remove());
+  doc.querySelectorAll("script,style,noscript").forEach((el) => {
+    el.remove();
+  });
 
   // normalize relative links so markdown is useful
   try {
@@ -173,34 +236,15 @@ const view = new WebGLGraphView(canvas, {
     void selectNodeById(node.id);
   },
   nodeStyle: (node) => {
-    const kind = node.kind || "";
-    if (kind === "file") return { sizePx: 4.8, color: rgba(0.42, 0.82, 0.98, 0.95) };
-    // urls: make them visually distinct from link edges (and from file nodes)
-    if (kind === "url") return { sizePx: 5.8, color: rgba(0.96, 0.46, 0.86, 0.96) };
-    if (kind === "dep") return { sizePx: 5.0, color: rgba(0.95, 0.75, 0.42, 0.95) };
-    return { sizePx: 4.6, color: rgba(0.62, 0.86, 0.9, 0.92) };
+    const style = nodeStyleForKind(inferNodeKind(node));
+    return { sizePx: style.sizePx, color: rgba(...style.color) };
   },
   edgeStyle: (edge) => {
-    const kind = edge.kind || "";
-
     // Auto-dim edges when you crank up render edges.
     // (Without this, 100k+ edges becomes a bright wall and hides the nodes.)
     const aMul = edgeAlphaScale;
-
-    // local structural edges
-    if (kind === "import") return { color: rgba(0.74, 0.58, 0.98, 0.22 * aMul) }; // violet
-    if (kind === "dep") return { color: rgba(0.98, 0.74, 0.36, 0.18 * aMul) }; // amber
-    if (kind === "ref") return { color: rgba(0.42, 0.86, 0.98, 0.16 * aMul) }; // cyan (internal md)
-    if (kind === "link") return { color: rgba(0.32, 0.9, 0.66, 0.14 * aMul) }; // green (file -> url)
-
-    // web weave edges (url -> url)
-    if (kind === "web") return { color: rgba(0.36, 0.94, 0.72, 0.10 * aMul) };
-
-    // user/sim overlay
-    if (kind === "user") return { color: rgba(0.98, 0.56, 0.42, 0.18 * aMul) };
-    if (kind === "observes") return { color: rgba(1.0, 0.92, 0.58, 0.18 * aMul) };
-
-    return { color: rgba(0.68, 0.78, 0.92, 0.08 * aMul) };
+    const color = edgeColorForKind(inferEdgeKind(edge), aMul);
+    return { color: rgba(...color) };
   },
 });
 
@@ -216,6 +260,157 @@ let lastMeta = null;
 let lastRenderCounts = { nodes: 0, edges: 0 };
 let lastGraphNodesById = new Map();
 
+function renderLegend(graph) {
+  if (!legendEl) return;
+
+  const layers = [...new Set([
+    ...graph.nodes.map((node) => inferLayer(node)),
+    ...graph.edges.map((edge) => inferLayer(edge)),
+  ])].sort();
+  const nodeKinds = [...new Set(graph.nodes.map((node) => inferNodeKind(node)))].sort();
+  const edgeKinds = [...new Set(graph.edges.map((edge) => inferEdgeKind(edge)))].sort();
+
+  const section = (title, rows) => `
+    <div class="legendSection">
+      <div class="legendTitle">${escapeHtml(title)}</div>
+      <div class="legendItems">${rows.join("\n")}</div>
+    </div>
+  `;
+
+  legendEl.innerHTML = [
+    section(
+      "layers",
+      layers.map((layer) => {
+        const color = rgbaCss(LAYER_COLORS[layer] || LAYER_COLORS.unknown);
+        return `<div class="legendItem"><span class="swatch" style="background:${escapeAttr(color)}"></span><span>${escapeHtml(layer)}</span></div>`;
+      }),
+    ),
+    section(
+      "node kinds",
+      nodeKinds.map((kind) => {
+        const color = rgbaCss(nodeStyleForKind(kind).color);
+        return `<div class="legendItem"><span class="swatch" style="background:${escapeAttr(color)}"></span><span>${escapeHtml(kind)}</span></div>`;
+      }),
+    ),
+    section(
+      "edge kinds",
+      edgeKinds.map((kind) => {
+        const color = rgbaCss(edgeColorForKind(kind));
+        return `<div class="legendItem"><span class="swatch swatchEdge" style="background:${escapeAttr(color)}"></span><span>${escapeHtml(kind)}</span></div>`;
+      }),
+    ),
+    `<div class="legendNote">Legend reflects the current OpenPlanner graph model: layers, node kinds, and edge kinds.</div>`,
+  ].join("\n");
+}
+
+function ensureFilterSelections(graph) {
+  const layers = [
+    ...graph.nodes.map((node) => inferLayer(node)),
+    ...graph.edges.map((edge) => inferLayer(edge)),
+  ];
+  const nodeKinds = graph.nodes.map((node) => inferNodeKind(node));
+  const edgeKinds = graph.edges.map((edge) => inferEdgeKind(edge));
+
+  if (!filterState.layers) filterState.layers = new Set(layers);
+  else layers.forEach((value) => {
+    filterState.layers.add(value);
+  });
+
+  if (!filterState.nodeKinds) filterState.nodeKinds = new Set(nodeKinds);
+  else nodeKinds.forEach((value) => {
+    filterState.nodeKinds.add(value);
+  });
+
+  if (!filterState.edgeKinds) filterState.edgeKinds = new Set(edgeKinds);
+  else edgeKinds.forEach((value) => {
+    filterState.edgeKinds.add(value);
+  });
+}
+
+function renderFilters(graph) {
+  if (!filtersEl) return;
+  ensureFilterSelections(graph);
+
+  const layers = [...new Set([
+    ...graph.nodes.map((node) => inferLayer(node)),
+    ...graph.edges.map((edge) => inferLayer(edge)),
+  ])].sort();
+  const nodeKinds = [...new Set(graph.nodes.map((node) => inferNodeKind(node)))].sort();
+  const edgeKinds = [...new Set(graph.edges.map((edge) => inferEdgeKind(edge)))].sort();
+
+  const checkbox = (group, value, checked) => `
+    <label class="filterOption">
+      <input type="checkbox" data-filter-group="${escapeAttr(group)}" data-filter-value="${escapeAttr(value)}" ${checked ? "checked" : ""} />
+      <span>${escapeHtml(value)}</span>
+    </label>
+  `;
+
+  filtersEl.innerHTML = `
+    <div class="legendSection">
+      <div class="legendTitle">layers</div>
+      <div class="filterGroup">${layers.map((value) => checkbox("layer", value, filterState.layers.has(value))).join("\n")}</div>
+    </div>
+    <div class="legendSection">
+      <div class="legendTitle">node kinds</div>
+      <div class="filterGroup">${nodeKinds.map((value) => checkbox("nodeKind", value, filterState.nodeKinds.has(value))).join("\n")}</div>
+    </div>
+    <div class="legendSection">
+      <div class="legendTitle">edge kinds</div>
+      <div class="filterGroup">${edgeKinds.map((value) => checkbox("edgeKind", value, filterState.edgeKinds.has(value))).join("\n")}</div>
+    </div>
+  `;
+}
+
+function applyGraphFilters() {
+  if (!fullGraph) return;
+
+  const nodes = fullGraph.nodes.filter((node) => {
+    return filterState.layers.has(inferLayer(node)) && filterState.nodeKinds.has(inferNodeKind(node));
+  });
+
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const edges = fullGraph.edges.filter((edge) => {
+    if (!filterState.layers.has(inferLayer(edge))) return false;
+    if (!filterState.edgeKinds.has(inferEdgeKind(edge))) return false;
+    return nodeIds.has(edge.source) && nodeIds.has(edge.target);
+  });
+
+  lastGraphNodesById = new Map(nodes.map((node) => [node.id, node]));
+  lastRenderCounts = { nodes: nodes.length, edges: edges.length };
+  edgeAlphaScale = edgeAlphaScaleForCount(lastRenderCounts.edges);
+  view.setGraph({ nodes, edges, meta: fullGraph.meta });
+}
+
+filtersEl?.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement)) return;
+
+  const group = target.getAttribute("data-filter-group");
+  const value = target.getAttribute("data-filter-value");
+  if (!value) return;
+
+  const toggle = (set) => {
+    if (target.checked) set.add(value);
+    else set.delete(value);
+    applyGraphFilters();
+    void loadStatus();
+  };
+
+  if (group === "layer") {
+    toggle(filterState.layers);
+    return;
+  }
+
+  if (group === "nodeKind") {
+    toggle(filterState.nodeKinds);
+    return;
+  }
+
+  if (group === "edgeKind") {
+    toggle(filterState.edgeKinds);
+  }
+});
+
 async function loadGraph() {
   const data = await gql(
     `query GraphView {
@@ -229,12 +424,7 @@ async function loadGraph() {
 
   const g = data.graphView;
   lastMeta = g.meta || null;
-  lastRenderCounts = { nodes: g.nodes?.length || 0, edges: g.edges?.length || 0 };
-  edgeAlphaScale = edgeAlphaScaleForCount(lastRenderCounts.edges);
-
-  lastGraphNodesById = new Map(g.nodes.map((n) => [n.id, n]));
-
-  const graph = {
+  fullGraph = {
     nodes: g.nodes.map((n) => ({
       id: n.id,
       kind: n.kind,
@@ -247,11 +437,15 @@ async function loadGraph() {
       source: e.source,
       target: e.target,
       kind: e.kind,
+      layer: e.layer,
+      data: parseDataJson(e.dataJson) ?? {},
     })),
     meta: g.meta,
   };
 
-  view.setGraph(graph);
+  renderLegend(fullGraph);
+  renderFilters(fullGraph);
+  applyGraphFilters();
 }
 
 async function loadStatus() {
