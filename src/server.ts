@@ -34,6 +34,28 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+function getBearer(headers: http.IncomingHttpHeaders): string | null {
+  const raw = headers.authorization;
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (!value) return null;
+  const match = /^Bearer\s+(.+)$/i.exec(value);
+  return match?.[1]?.trim() || null;
+}
+
+async function readBody(req: http.IncomingMessage, maxBytes = 10_000_000): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    chunks.push(buffer);
+    total += buffer.length;
+    if (total > maxBytes) {
+      throw new Error("request too large");
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function notFound(res: http.ServerResponse): void {
   res.statusCode = 404;
   res.end("not found");
@@ -960,8 +982,10 @@ async function main(): Promise<void> {
     return config;
   };
 
+  const adminToken = String(process.env.GRAPH_WEAVER_ADMIN_TOKEN || "").trim() || null;
+
   const graphqlHandler = createGraphQLHandler({
-    adminToken: String(process.env.GRAPH_WEAVER_ADMIN_TOKEN || "").trim() || null,
+    adminToken,
     getConfig: () => config,
     updateConfig,
     getStatus,
@@ -998,6 +1022,41 @@ async function main(): Promise<void> {
 
     if (pathname === "/api/graph") {
       json(res, 200, buildGraphView());
+      return;
+    }
+
+    if (pathname === "/api/layout/upsert") {
+      res.setHeader("access-control-allow-origin", "*");
+      res.setHeader("access-control-allow-methods", "POST,OPTIONS");
+      res.setHeader("access-control-allow-headers", "content-type,authorization");
+      if (req.method === "OPTIONS") {
+        res.statusCode = 204;
+        res.end();
+        return;
+      }
+      if (req.method !== "POST") {
+        json(res, 405, { error: "method not allowed" });
+        return;
+      }
+      if (adminToken && getBearer(req.headers) !== adminToken) {
+        json(res, 401, { error: "unauthorized" });
+        return;
+      }
+
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as { inputs?: Array<{ id?: string; x?: number; y?: number }> };
+        const inputs = Array.isArray(parsed.inputs) ? parsed.inputs : [];
+        const updated = await layoutUpsertPositions(inputs.map((row) => ({
+          id: String(row?.id ?? ""),
+          x: Number(row?.x ?? 0),
+          y: Number(row?.y ?? 0),
+        })));
+        json(res, 200, { ok: true, updated });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        json(res, 400, { error: message });
+      }
       return;
     }
 
