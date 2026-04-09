@@ -60,6 +60,8 @@ export async function rebuildOpenPlannerGraph(params: {
   openPlannerApiKey?: string;
   store: GraphStore;
   projects?: string[];
+  includeSemantic?: boolean;
+  semanticMinSimilarity?: number;
 }): Promise<{ seeds: string[] }> {
   const baseUrl = trimBaseUrl(params.openPlannerBaseUrl || "");
   if (!baseUrl) {
@@ -70,6 +72,12 @@ export async function rebuildOpenPlannerGraph(params: {
   const qs = new URLSearchParams();
   if (projects.length > 0) qs.set("projects", projects.join(","));
   qs.set("includeLayout", "true");
+  if (params.includeSemantic) {
+    qs.set("includeSemantic", "true");
+    if (typeof params.semanticMinSimilarity === "number") {
+      qs.set("semanticMinSimilarity", String(params.semanticMinSimilarity));
+    }
+  }
   const query = `?${qs.toString()}`;
   const payload = await fetchJson<ExportPayload>(`${baseUrl}/v1/graph/export${query}`, params.openPlannerApiKey);
 
@@ -106,12 +114,13 @@ export async function rebuildOpenPlannerGraph(params: {
       target_lake: edge.targetLake ?? (edge.data as any)?.target_lake,
     } as Record<string, unknown>;
 
+    const isSemantic = edge.lake === "semantic" || edge.kind === "semantic_knn" || edge.kind === "semantic_similarity";
     const graphEdge: GraphEdge = {
       id: edge.id,
       source: edge.source,
       target: edge.target,
       kind: edge.kind,
-      layer: "local",
+      layer: isSemantic ? "semantic" : "local",
       data,
     };
     params.store.upsertEdge(graphEdge);

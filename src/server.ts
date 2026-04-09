@@ -205,6 +205,8 @@ async function main(): Promise<void> {
     .split(",")
     .map((p) => p.trim())
     .filter(Boolean);
+  const includeSemanticEdges = !/^(0|false|no)$/i.test(String(process.env.GRAPH_WEAVER_INCLUDE_SEMANTIC_EDGES || "true"));
+  const semanticMinSimilarity = Math.max(0, Math.min(1, Number(process.env.GRAPH_WEAVER_SEMANTIC_MIN_SIMILARITY ?? 0.75)));
   const requestedPersistenceMode = String(process.env.GRAPH_WEAVER_PERSISTENCE_MODE || "").trim().toLowerCase();
   const webCrawlEnabled = !/^(0|false|no)$/i.test(String(process.env.GRAPH_WEAVER_WEB_CRAWL_ENABLED || "true"));
   const includeWebLayerWhenIdle = !/^(0|false|no)$/i.test(
@@ -436,6 +438,8 @@ async function main(): Promise<void> {
                 openPlannerApiKey,
                 store: fresh,
                 projects: openPlannerProjects,
+                includeSemantic: includeSemanticEdges,
+                semanticMinSimilarity,
               })
           : localSourceMode === "openplanner-lakes"
             ? await rebuildLakeGraph({
