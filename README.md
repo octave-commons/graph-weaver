@@ -6,6 +6,9 @@ A small dev service that:
 2. shows it in a WebGL graph view
 3. passively grows a web graph from discovered external links using an ACO-ish crawler
 
+
+> Built with [GLM-5](https://z.ai) — part of the [z.ai](https://z.ai) startup ecosystem and the [Ussyverse](https://ussy.cloud).
+
 ## Reading order
 
 1. `docs/INDEX.md`
